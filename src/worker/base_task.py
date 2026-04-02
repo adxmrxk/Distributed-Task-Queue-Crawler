@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 from src.core.config import settings
 from src.utils.retry_utils import calculate_exponential_backoff
-from src.db.session import get_db_session
+from src.db.elasticsearch_client import es_client
 from src.db.repositories.task_repository import TaskRepository
 
 logger = logging.getLogger(__name__)
@@ -48,8 +48,6 @@ class BaseTaskWithRetry(Task):
             extra={
                 'task_id': task_id,
                 'task_name': self.name,
-                'args': args,
-                'kwargs': kwargs
             }
         )
 
@@ -71,17 +69,14 @@ class BaseTaskWithRetry(Task):
 
         # Log retry to database
         try:
-            with get_db_session() as db:
-                TaskRepository.create_retry_history(
-                    db=db,
-                    task_metadata_id=None,  # Link later if needed
-                    celery_task_id=task_id,
-                    retry_number=retry_count,
-                    exception_class=exc.__class__.__name__,
-                    exception_message=str(exc),
-                    next_retry_eta=datetime.utcnow(),
-                    backoff_seconds=backoff
-                )
+            TaskRepository.create_retry_history(
+                es=es_client,
+                celery_task_id=task_id,
+                retry_number=retry_count,
+                exception_class=exc.__class__.__name__,
+                exception_message=str(exc),
+                backoff_seconds=backoff,
+            )
         except Exception as e:
             logger.error(f"Failed to log retry history: {e}")
 
@@ -104,15 +99,7 @@ class BaseTaskWithRetry(Task):
 
         # Update task metadata
         try:
-            with get_db_session() as db:
-                TaskRepository.update_task_status(
-                    db=db,
-                    celery_task_id=task_id,
-                    status='FAILURE',
-                    exception_class=exc.__class__.__name__,
-                    exception_message=str(exc),
-                    traceback=str(einfo.traceback)
-                )
+            TaskRepository.update_task_status(es=es_client, celery_task_id=task_id, status='FAILURE')
         except Exception as e:
             logger.error(f"Failed to update task metadata: {e}")
 
@@ -129,42 +116,24 @@ class BaseTaskWithRetry(Task):
 
         # Update task metadata
         try:
-            with get_db_session() as db:
-                TaskRepository.update_task_status(
-                    db=db,
-                    celery_task_id=task_id,
-                    status='SUCCESS',
-                    result={'return_value': retval} if retval else None
-                )
+            TaskRepository.update_task_status(es=es_client, celery_task_id=task_id, status='SUCCESS')
         except Exception as e:
             logger.error(f"Failed to update task metadata: {e}")
 
     def _move_to_dlq(self, task_id, args, kwargs, exc, einfo):
         """Move failed task to Dead Letter Queue"""
         try:
-            with get_db_session() as db:
-                # Extract job_id if present
-                job_id = kwargs.get('job_id') or (args[0] if args else None)
-
-                TaskRepository.move_to_dlq(
-                    db=db,
-                    job_id=job_id,
-                    celery_task_id=task_id,
-                    task_name=self.name,
-                    args={'args': args},
-                    kwargs=kwargs,
-                    exception_class=exc.__class__.__name__,
-                    exception_message=str(exc),
-                    traceback=str(einfo.traceback),
-                    total_retries=self.request.retries,
-                    first_failure_at=datetime.utcnow()
-                )
-
-                logger.info(
-                    f"Moved task to DLQ: {task_id}",
-                    extra={'task_id': task_id, 'task_name': self.name}
-                )
-
+            job_id = kwargs.get('job_id') or (args[0] if args else None)
+            TaskRepository.move_to_dlq(
+                es=es_client,
+                job_id=job_id,
+                celery_task_id=task_id,
+                task_name=self.name,
+                exception_class=exc.__class__.__name__,
+                exception_message=str(exc),
+                traceback=str(einfo.traceback),
+                total_retries=self.request.retries,
+            )
         except Exception as e:
             logger.error(f"Failed to move task to DLQ: {e}")
 

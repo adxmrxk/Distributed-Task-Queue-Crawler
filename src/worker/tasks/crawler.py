@@ -1,16 +1,18 @@
 from celery import group
+from confluent_kafka import Producer
 import asyncio
 import hashlib
+import json
 import redis
-from uuid import UUID
 import logging
+
 from src.worker.celery_app import app
 from src.worker.base_task import BaseTaskWithRetry
 from src.crawler.playwright_crawler import PlaywrightCrawler
 from src.crawler.rate_limiter import DistributedRateLimiter
 from src.crawler.politeness import PolitenessPolicy
 from src.crawler.link_extractor import LinkExtractor
-from src.db.session import get_db_session
+from src.db.elasticsearch_client import es_client
 from src.db.repositories.job_repository import JobRepository
 from src.db.repositories.link_repository import LinkRepository
 from src.utils.url_utils import normalize_url, get_domain
@@ -20,172 +22,127 @@ from src.core.exceptions import RobotsTxtDeniedException, CrawlTimeoutException
 
 logger = logging.getLogger(__name__)
 
-# Initialize Redis client for visited URL tracking
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-
-# Initialize rate limiter and politeness policy
 rate_limiter = DistributedRateLimiter()
 politeness = PolitenessPolicy()
+
+# Kafka producer — initialized lazily so import errors don't block the API
+_kafka_producer = None
+
+def get_kafka_producer():
+    global _kafka_producer
+    if _kafka_producer is None:
+        _kafka_producer = Producer({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
+    return _kafka_producer
 
 
 @app.task(base=BaseTaskWithRetry, bind=True, name='crawler.crawl_url')
 def crawl_url(self, job_id: str, url: str, depth: int = 0):
-    """
-    Crawl a single URL and spawn tasks for discovered links (BFS)
-
-    Args:
-        job_id: UUID of the crawl job
-        url: URL to crawl
-        depth: Current depth in the crawl tree
-
-    Returns:
-        Dictionary with crawl results
-    """
-    logger.info(
-        f"Crawling URL at depth {depth}",
-        extra={'job_id': job_id, 'url': url, 'depth': depth}
-    )
+    logger.info(f"Crawling URL at depth {depth}", extra={'job_id': job_id, 'url': url})
 
     try:
-        # Get job from database
-        with get_db_session() as db:
-            job = JobRepository.get(db, UUID(job_id))
+        job = JobRepository.get(es_client, job_id)
+        if not job:
+            logger.error(f"Job not found: {job_id}")
+            return {'error': 'Job not found'}
 
-            if not job:
-                logger.error(f"Job not found: {job_id}")
-                return {'error': 'Job not found'}
+        if job['status'] == JobStatus.CANCELLED.value:
+            return {'status': 'cancelled'}
 
-            # Check if job was cancelled
-            if job.status == JobStatus.CANCELLED.value:
-                logger.info(f"Job cancelled, stopping crawl: {job_id}")
-                return {'status': 'cancelled'}
+        if depth > job['max_depth']:
+            return {'status': 'max_depth_reached'}
 
-            # Check depth limit
-            if depth > job.max_depth:
-                logger.debug(f"Max depth reached for {url}")
-                return {'status': 'max_depth_reached'}
+        if job['total_pages_crawled'] >= job['max_pages']:
+            return {'status': 'max_pages_reached'}
 
-            # Check page limit
-            if job.total_pages_crawled >= job.max_pages:
-                logger.info(f"Max pages reached for job {job_id}")
-                return {'status': 'max_pages_reached'}
-
-        # Check if URL already visited (Redis for fast lookup)
+        # Deduplicate via Redis (fast) + ES (persistent)
         normalized = normalize_url(url)
         url_hash = hashlib.sha256(normalized.encode()).hexdigest()
         visited_key = f"visited:{job_id}:{url_hash}"
 
         if redis_client.exists(visited_key):
-            logger.debug(f"URL already visited: {url}")
             return {'status': 'already_visited'}
 
-        # Mark as visiting (prevent duplicate concurrent crawls)
-        redis_client.setex(visited_key, 3600, "1")  # 1 hour TTL
+        redis_client.setex(visited_key, 3600, "1")
 
-        # Get domain for rate limiting
         domain = get_domain(url)
         if not domain:
-            logger.warning(f"Could not extract domain from {url}")
             return {'error': 'invalid_url'}
 
-        # Check robots.txt if enabled
-        if job.respect_robots_txt:
+        if job.get('respect_robots_txt'):
             can_fetch = asyncio.run(politeness.can_fetch(url))
             if not can_fetch:
-                logger.info(f"robots.txt denies access to {url}")
                 raise RobotsTxtDeniedException(f"robots.txt denies: {url}")
 
-        # Acquire rate limit token
         acquired = asyncio.run(rate_limiter.acquire(domain, tokens=1, max_wait=30.0))
         if not acquired:
-            logger.warning(f"Failed to acquire rate limit for {domain}")
-            # Retry later
             raise self.retry(countdown=10, max_retries=3)
 
-        # Crawl the page with Playwright
         async def crawl():
             async with PlaywrightCrawler() as crawler:
                 return await crawler.crawl_page(url)
 
         result = asyncio.run(crawl())
 
+        # Index the page into Elasticsearch (whether or not there was an error)
+        LinkRepository.create_visited_url(
+            es=es_client,
+            job_id=job_id,
+            url=url,
+            normalized_url=normalized,
+            title=result.get('title'),
+            content=result.get('content'),
+            depth=depth,
+            status_code=result.get('status'),
+            content_type=result.get('content_type'),
+            links_count=len(result.get('links', [])),
+        )
+
         if result['error']:
-            logger.warning(
-                f"Error crawling {url}: {result['error']}",
-                extra={'url': url, 'error': result['error']}
-            )
-            # Store visited URL even if failed
-            with get_db_session() as db:
-                LinkRepository.create_visited_url(
-                    db=db,
-                    job_id=UUID(job_id),
-                    url=url,
-                    normalized_url=normalized,
-                    depth=depth,
-                    status_code=result.get('status'),
-                    content_type=result.get('content_type')
-                )
+            logger.warning(f"Error crawling {url}: {result['error']}")
             return result
 
-        # Store visited URL in database
-        with get_db_session() as db:
-            LinkRepository.create_visited_url(
-                db=db,
-                job_id=UUID(job_id),
-                url=url,
-                normalized_url=normalized,
-                depth=depth,
-                status_code=result['status'],
-                content_type=result.get('content_type')
-            )
+        JobRepository.increment_pages_crawled(es_client, job_id)
+        JobRepository.increment_links_found(es_client, job_id, len(result['links']))
 
-            # Update job statistics
-            JobRepository.increment_pages_crawled(db, UUID(job_id))
-            JobRepository.increment_links_found(db, UUID(job_id), len(result['links']))
-
-        # Extract and categorize links
         categorized = LinkExtractor.extract_links(
             base_url=url,
             links=result['links'],
-            same_domain_only=False
+            same_domain_only=False,
         )
-
         internal_links = categorized['internal']
         external_links = categorized['external']
 
-        logger.info(
-            f"Extracted links from {url}: {len(internal_links)} internal, {len(external_links)} external",
-            extra={
-                'url': url,
-                'internal_count': len(internal_links),
-                'external_count': len(external_links)
-            }
-        )
-
-        # Spawn tasks for internal links (crawl further) - BFS pattern
-        if internal_links and depth < job.max_depth:
-            # Limit fan-out to prevent queue explosion
+        # BFS: spawn crawl tasks for internal links
+        links_to_crawl = []
+        if internal_links and depth < job['max_depth']:
             links_to_crawl = internal_links[:100]
+            if links_to_crawl:
+                redis_client.incrby(f"active_tasks:{job_id}", len(links_to_crawl))
+                tasks = group(
+                    crawl_url.s(job_id, link_url, depth + 1)
+                    for link_url in links_to_crawl
+                )
+                tasks.apply_async()
 
-            tasks = group(
-                crawl_url.s(job_id, link_url, depth + 1)
-                for link_url in links_to_crawl
-            )
-            tasks.apply_async()
-
-            logger.debug(f"Spawned {len(links_to_crawl)} crawl tasks for next depth level")
-
-        # Spawn link checking tasks for external links
+        # Publish link-check job to Kafka — consumed by the Go link checker service.
         if external_links:
-            from src.worker.tasks.link_checker import check_links_batch
+            payload = json.dumps({
+                "job_id": job_id,
+                "source_url": url,
+                "target_urls": external_links,
+                "depth": depth,
+            }).encode("utf-8")
+            producer = get_kafka_producer()
+            producer.produce("link_check_jobs", value=payload, key=job_id.encode("utf-8"))
+            producer.poll(0)
 
-            # Batch external links for efficient checking
-            check_links_batch.apply_async(
-                args=[job_id, url, external_links, depth],
-                queue='link_checker'
-            )
-
-            logger.debug(f"Spawned batch link check for {len(external_links)} external links")
+        # Decrement active task counter and mark job complete if this was the last task
+        active = redis_client.decr(f"active_tasks:{job_id}")
+        if active <= 0 and job['status'] == JobStatus.IN_PROGRESS.value:
+            JobRepository.update_status(es_client, job_id, JobStatus.COMPLETED.value)
+            redis_client.delete(f"active_tasks:{job_id}")
+            logger.info(f"Job {job_id} completed")
 
         return {
             'status': 'success',
@@ -193,27 +150,19 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
             'depth': depth,
             'internal_links': len(internal_links),
             'external_links': len(external_links),
-            'http_status': result['status']
         }
 
     except CrawlTimeoutException as e:
-        logger.warning(f"Timeout crawling {url}: {str(e)}")
-        raise self.retry(exc=e, countdown=calculate_countdown(self.request.retries))
+        raise self.retry(exc=e, countdown=_backoff(self.request.retries))
 
     except RobotsTxtDeniedException:
-        # Don't retry robots.txt denials
         return {'status': 'robots_denied', 'url': url}
 
     except Exception as e:
-        logger.error(
-            f"Error in crawl_url task: {str(e)}",
-            extra={'job_id': job_id, 'url': url, 'depth': depth},
-            exc_info=True
-        )
+        logger.error(f"Error in crawl_url: {e}", extra={'job_id': job_id, 'url': url}, exc_info=True)
         raise
 
 
-def calculate_countdown(retry_count: int) -> int:
-    """Calculate exponential backoff countdown"""
+def _backoff(retry_count: int) -> int:
     from src.utils.retry_utils import calculate_exponential_backoff
     return calculate_exponential_backoff(retry_count)

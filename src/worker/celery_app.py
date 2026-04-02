@@ -41,9 +41,7 @@ app.conf.update(
 
     # Task routing
     task_routes={
-        'src.worker.tasks.crawler.crawl_url': {'queue': 'crawler'},
-        'src.worker.tasks.link_checker.check_link': {'queue': 'link_checker'},
-        'src.worker.tasks.link_checker.check_links_batch': {'queue': 'link_checker'},
+        'crawler.crawl_url': {'queue': 'crawler'},
     },
 
     # Queue definitions with priority support
@@ -52,12 +50,6 @@ app.conf.update(
             'crawler',
             Exchange('crawler'),
             routing_key='crawler',
-            queue_arguments={'x-max-priority': 10}
-        ),
-        Queue(
-            'link_checker',
-            Exchange('link_checker'),
-            routing_key='link_checker',
             queue_arguments={'x-max-priority': 10}
         ),
         Queue(
@@ -91,6 +83,6 @@ app.conf.update(
 )
 
 # Import tasks to register them
-from src.worker.tasks import crawler, link_checker
+from src.worker.tasks import crawler
 
 __all__ = ['app']
