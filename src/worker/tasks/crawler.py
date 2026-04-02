@@ -104,6 +104,9 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
 
         JobRepository.increment_pages_crawled(es_client, job_id)
         JobRepository.increment_links_found(es_client, job_id, len(result['links']))
+        # Update last activity timestamp for completion detection
+        import time
+        redis_client.set(f"last_activity:{job_id}", str(time.time()), ex=3600)
 
         categorized = LinkExtractor.extract_links(
             base_url=url,
@@ -114,11 +117,9 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
         external_links = categorized['external']
 
         # BFS: spawn crawl tasks for internal links
-        links_to_crawl = []
         if internal_links and depth < job['max_depth']:
             links_to_crawl = internal_links[:100]
             if links_to_crawl:
-                redis_client.incrby(f"active_tasks:{job_id}", len(links_to_crawl))
                 tasks = group(
                     crawl_url.s(job_id, link_url, depth + 1)
                     for link_url in links_to_crawl
@@ -137,12 +138,8 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
             producer.produce("link_check_jobs", value=payload, key=job_id.encode("utf-8"))
             producer.poll(0)
 
-        # Decrement active task counter and mark job complete if this was the last task
-        active = redis_client.decr(f"active_tasks:{job_id}")
-        if active <= 0 and job['status'] == JobStatus.IN_PROGRESS.value:
-            JobRepository.update_status(es_client, job_id, JobStatus.COMPLETED.value)
-            redis_client.delete(f"active_tasks:{job_id}")
-            logger.info(f"Job {job_id} completed")
+        # Schedule a completion check 30 seconds from now
+        check_job_completion.apply_async(args=[job_id], countdown=30)
 
         return {
             'status': 'success',
@@ -166,3 +163,23 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
 def _backoff(retry_count: int) -> int:
     from src.utils.retry_utils import calculate_exponential_backoff
     return calculate_exponential_backoff(retry_count)
+
+
+@app.task(name='crawler.check_job_completion')
+def check_job_completion(job_id: str):
+    """Mark a job as completed if no new pages have been crawled in the last 30 seconds."""
+    import time
+    job = JobRepository.get(es_client, job_id)
+    if not job or job['status'] != JobStatus.IN_PROGRESS.value:
+        return
+
+    last = redis_client.get(f"last_activity:{job_id}")
+    if last and (time.time() - float(last)) < 30:
+        # Still active — check again in 30 seconds
+        check_job_completion.apply_async(args=[job_id], countdown=30)
+        return
+
+    # No activity for 30s — mark complete
+    JobRepository.update_status(es_client, job_id, JobStatus.COMPLETED.value)
+    redis_client.delete(f"last_activity:{job_id}")
+    logger.info(f"Job {job_id} marked as completed")

@@ -30,10 +30,6 @@ async def create_job(request: JobCreateRequest, es: Elasticsearch = Depends(get_
             respect_robots_txt=request.respect_robots_txt,
         )
 
-        import redis as redis_lib
-        _redis = redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
-        _redis.set(f"active_tasks:{job['id']}", 1)
-
         task = crawl_url.apply_async(args=[job["id"], request.url, 0], queue="crawler")
 
         JobRepository.update_celery_task_id(es, job["id"], task.id)
