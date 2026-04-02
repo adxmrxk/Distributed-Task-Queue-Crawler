@@ -1,7 +1,7 @@
-from sqlalchemy.orm import Session
-from src.db.session import get_db
+from elasticsearch import Elasticsearch
+from src.db.elasticsearch_client import get_es_client
 
-# Dependency for database session injection
-def get_database() -> Session:
-    """FastAPI dependency for database sessions"""
-    return next(get_db())
+
+def get_es() -> Elasticsearch:
+    """FastAPI dependency — injects an Elasticsearch client into route handlers."""
+    return get_es_client()
