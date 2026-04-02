@@ -38,7 +38,7 @@ class CrawlJob(Base):
     error_message = Column(Text, nullable=True)
 
     # Flexible metadata storage
-    metadata = Column(JSONB, nullable=True)
+    job_metadata = Column(JSONB, nullable=True)
 
     # Indexes for common queries
     __table_args__ = (

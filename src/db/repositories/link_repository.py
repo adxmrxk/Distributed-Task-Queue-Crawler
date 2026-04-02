@@ -1,107 +1,110 @@
-from sqlalchemy.orm import Session
+from elasticsearch import Elasticsearch
 from typing import Optional, List
-from uuid import UUID
-from src.db.models.broken_link import BrokenLink
-from src.db.models.visited_url import VisitedUrl
+from datetime import datetime, timezone
 import hashlib
+import uuid
+import logging
+
+from src.db.indices import BROKEN_LINKS_INDEX, CRAWLED_PAGES_INDEX
+from src.db.elasticsearch_client import doc_to_dict
+
+logger = logging.getLogger(__name__)
 
 
 class LinkRepository:
-    """Repository for link-related operations"""
+
+    # ------------------------------------------------------------------
+    # Broken links
+    # ------------------------------------------------------------------
 
     @staticmethod
     def create_broken_link(
-        db: Session,
-        job_id: UUID,
+        es: Elasticsearch,
+        job_id: str,
         source_url: str,
         broken_url: str,
         anchor_text: Optional[str] = None,
         status_code: Optional[int] = None,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
-        depth: Optional[int] = None
-    ) -> BrokenLink:
-        """Create a new broken link record"""
-        broken_link = BrokenLink(
-            job_id=job_id,
-            source_url=source_url,
-            broken_url=broken_url,
-            anchor_text=anchor_text,
-            status_code=status_code,
-            error_type=error_type,
-            error_message=error_message,
-            depth=depth
-        )
-        db.add(broken_link)
-        db.commit()
-        db.refresh(broken_link)
-        return broken_link
+        depth: Optional[int] = None,
+    ) -> dict:
+        doc = {
+            "job_id": job_id,
+            "source_url": source_url,
+            "broken_url": broken_url,
+            "anchor_text": anchor_text,
+            "status_code": status_code,
+            "error_type": error_type,
+            "error_message": error_message,
+            "depth": depth,
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        doc_id = str(uuid.uuid4())
+        es.index(index=BROKEN_LINKS_INDEX, id=doc_id, document=doc, refresh=True)
+        doc["id"] = doc_id
+        return doc
 
     @staticmethod
     def get_broken_links_by_job(
-        db: Session,
-        job_id: UUID,
+        es: Elasticsearch,
+        job_id: str,
         skip: int = 0,
-        limit: int = 100
-    ) -> List[BrokenLink]:
-        """Get broken links for a job"""
-        return db.query(BrokenLink).filter(
-            BrokenLink.job_id == job_id
-        ).order_by(
-            BrokenLink.discovered_at.desc()
-        ).offset(skip).limit(limit).all()
+        limit: int = 100,
+    ) -> List[dict]:
+        resp = es.search(
+            index=BROKEN_LINKS_INDEX,
+            query={"term": {"job_id": job_id}},
+            sort=[{"discovered_at": {"order": "desc"}}],
+            from_=skip,
+            size=limit,
+        )
+        return [doc_to_dict(h) for h in resp["hits"]["hits"]]
 
     @staticmethod
-    def count_broken_links_by_job(db: Session, job_id: UUID) -> int:
-        """Count broken links for a job"""
-        return db.query(BrokenLink).filter(BrokenLink.job_id == job_id).count()
+    def count_broken_links_by_job(es: Elasticsearch, job_id: str) -> int:
+        resp = es.count(index=BROKEN_LINKS_INDEX, query={"term": {"job_id": job_id}})
+        return resp["count"]
+
+    # ------------------------------------------------------------------
+    # Visited / crawled pages
+    # ------------------------------------------------------------------
 
     @staticmethod
     def create_visited_url(
-        db: Session,
-        job_id: UUID,
+        es: Elasticsearch,
+        job_id: str,
         url: str,
         normalized_url: str,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
         depth: Optional[int] = None,
         status_code: Optional[int] = None,
-        content_type: Optional[str] = None
-    ) -> VisitedUrl:
-        """Create a visited URL record"""
+        content_type: Optional[str] = None,
+        links_count: int = 0,
+    ) -> dict:
         url_hash = hashlib.sha256(normalized_url.encode()).hexdigest()
-
-        visited = VisitedUrl(
-            job_id=job_id,
-            url_hash=url_hash,
-            original_url=url,
-            normalized_url=normalized_url,
-            depth=depth,
-            status_code=status_code,
-            content_type=content_type
-        )
-        db.add(visited)
-        db.commit()
-        db.refresh(visited)
-        return visited
+        doc = {
+            "job_id": job_id,
+            "url": url,
+            "normalized_url": normalized_url,
+            "url_hash": url_hash,
+            "title": title,
+            "content": content,
+            "depth": depth,
+            "status_code": status_code,
+            "content_type": content_type,
+            "links_count": links_count,
+            "crawled_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Use url_hash as doc ID so re-visiting the same URL within a job is idempotent
+        doc_id = f"{job_id}:{url_hash}"
+        es.index(index=CRAWLED_PAGES_INDEX, id=doc_id, document=doc, refresh=True)
+        doc["id"] = doc_id
+        return doc
 
     @staticmethod
-    def is_url_visited(db: Session, job_id: UUID, normalized_url: str) -> bool:
-        """Check if a URL has been visited in this job"""
+    def is_url_visited(es: Elasticsearch, job_id: str, normalized_url: str) -> bool:
         url_hash = hashlib.sha256(normalized_url.encode()).hexdigest()
-        return db.query(VisitedUrl).filter(
-            VisitedUrl.job_id == job_id,
-            VisitedUrl.url_hash == url_hash
-        ).first() is not None
-
-    @staticmethod
-    def get_visited_urls_by_job(
-        db: Session,
-        job_id: UUID,
-        skip: int = 0,
-        limit: int = 100
-    ) -> List[VisitedUrl]:
-        """Get visited URLs for a job"""
-        return db.query(VisitedUrl).filter(
-            VisitedUrl.job_id == job_id
-        ).order_by(
-            VisitedUrl.visited_at.desc()
-        ).offset(skip).limit(limit).all()
+        doc_id = f"{job_id}:{url_hash}"
+        return es.exists(index=CRAWLED_PAGES_INDEX, id=doc_id)

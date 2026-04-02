@@ -1,137 +1,148 @@
-from sqlalchemy.orm import Session
+from elasticsearch import Elasticsearch, NotFoundError
 from typing import Optional, List
-from uuid import UUID
-from datetime import datetime
-from src.db.models.job import CrawlJob
+from datetime import datetime, timezone
+import uuid
+import logging
+
+from src.db.indices import CRAWL_JOBS_INDEX
+from src.db.elasticsearch_client import doc_to_dict
 from src.core.constants import JobStatus
+
+logger = logging.getLogger(__name__)
 
 
 class JobRepository:
-    """Repository for CrawlJob operations"""
 
     @staticmethod
     def create(
-        db: Session,
+        es: Elasticsearch,
         url: str,
         max_depth: int = 3,
         max_pages: int = 100,
         respect_robots_txt: bool = True,
         user_id: Optional[str] = None,
-        metadata: Optional[dict] = None
-    ) -> CrawlJob:
-        """Create a new crawl job"""
-        job = CrawlJob(
-            url=url,
-            max_depth=max_depth,
-            max_pages=max_pages,
-            respect_robots_txt=respect_robots_txt,
-            user_id=user_id,
-            metadata=metadata,
-            status=JobStatus.PENDING.value
-        )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return job
+    ) -> dict:
+        job_id = str(uuid.uuid4())
+        doc = {
+            "url": url,
+            "status": JobStatus.PENDING.value,
+            "max_depth": max_depth,
+            "max_pages": max_pages,
+            "respect_robots_txt": respect_robots_txt,
+            "user_id": user_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": None,
+            "completed_at": None,
+            "total_pages_crawled": 0,
+            "total_links_found": 0,
+            "total_broken_links": 0,
+            "celery_task_id": None,
+            "error_message": None,
+        }
+        es.index(index=CRAWL_JOBS_INDEX, id=job_id, document=doc, refresh=True)
+        doc["id"] = job_id
+        return doc
 
     @staticmethod
-    def get(db: Session, job_id: UUID) -> Optional[CrawlJob]:
-        """Get job by ID"""
-        return db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-
-    @staticmethod
-    def get_by_celery_task_id(db: Session, celery_task_id: str) -> Optional[CrawlJob]:
-        """Get job by Celery task ID"""
-        return db.query(CrawlJob).filter(CrawlJob.celery_task_id == celery_task_id).first()
+    def get(es: Elasticsearch, job_id: str) -> Optional[dict]:
+        try:
+            hit = es.get(index=CRAWL_JOBS_INDEX, id=job_id)
+            return doc_to_dict(hit)
+        except NotFoundError:
+            return None
 
     @staticmethod
     def list_jobs(
-        db: Session,
+        es: Elasticsearch,
         skip: int = 0,
         limit: int = 100,
         status: Optional[str] = None,
-        user_id: Optional[str] = None
-    ) -> List[CrawlJob]:
-        """List jobs with optional filtering"""
-        query = db.query(CrawlJob)
-
+        user_id: Optional[str] = None,
+    ) -> List[dict]:
+        must = []
         if status:
-            query = query.filter(CrawlJob.status == status)
+            must.append({"term": {"status": status}})
         if user_id:
-            query = query.filter(CrawlJob.user_id == user_id)
+            must.append({"term": {"user_id": user_id}})
 
-        return query.order_by(CrawlJob.created_at.desc()).offset(skip).limit(limit).all()
+        query = {"bool": {"must": must}} if must else {"match_all": {}}
+
+        resp = es.search(
+            index=CRAWL_JOBS_INDEX,
+            query=query,
+            sort=[{"created_at": {"order": "desc"}}],
+            from_=skip,
+            size=limit,
+        )
+        return [doc_to_dict(h) for h in resp["hits"]["hits"]]
 
     @staticmethod
     def update_status(
-        db: Session,
-        job_id: UUID,
+        es: Elasticsearch,
+        job_id: str,
         status: str,
-        error_message: Optional[str] = None
-    ) -> Optional[CrawlJob]:
-        """Update job status"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            job.status = status
+        error_message: Optional[str] = None,
+    ) -> Optional[dict]:
+        now = datetime.now(timezone.utc).isoformat()
+        update: dict = {"status": status}
 
-            if status == JobStatus.IN_PROGRESS.value and not job.started_at:
-                job.started_at = datetime.utcnow()
-            elif status in [JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value]:
-                job.completed_at = datetime.utcnow()
+        if status == JobStatus.IN_PROGRESS.value:
+            # Only set started_at if not already set
+            existing = JobRepository.get(es, job_id)
+            if existing and not existing.get("started_at"):
+                update["started_at"] = now
+        elif status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+            update["completed_at"] = now
 
-            if error_message:
-                job.error_message = error_message
+        if error_message:
+            update["error_message"] = error_message
 
-            db.commit()
-            db.refresh(job)
-        return job
-
-    @staticmethod
-    def update_celery_task_id(db: Session, job_id: UUID, celery_task_id: str) -> Optional[CrawlJob]:
-        """Update Celery task ID"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            job.celery_task_id = celery_task_id
-            db.commit()
-            db.refresh(job)
-        return job
+        try:
+            es.update(index=CRAWL_JOBS_INDEX, id=job_id, doc=update, refresh=True)
+            return JobRepository.get(es, job_id)
+        except NotFoundError:
+            return None
 
     @staticmethod
-    def increment_pages_crawled(db: Session, job_id: UUID) -> Optional[CrawlJob]:
-        """Increment pages crawled counter"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            job.total_pages_crawled += 1
-            db.commit()
-            db.refresh(job)
-        return job
+    def update_celery_task_id(es: Elasticsearch, job_id: str, celery_task_id: str) -> Optional[dict]:
+        try:
+            es.update(index=CRAWL_JOBS_INDEX, id=job_id, doc={"celery_task_id": celery_task_id}, refresh=True)
+            return JobRepository.get(es, job_id)
+        except NotFoundError:
+            return None
 
     @staticmethod
-    def increment_links_found(db: Session, job_id: UUID, count: int = 1) -> Optional[CrawlJob]:
-        """Increment links found counter"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            job.total_links_found += count
-            db.commit()
-            db.refresh(job)
-        return job
+    def increment_pages_crawled(es: Elasticsearch, job_id: str) -> None:
+        es.update(
+            index=CRAWL_JOBS_INDEX,
+            id=job_id,
+            script={"source": "ctx._source.total_pages_crawled += 1", "lang": "painless"},
+        )
 
     @staticmethod
-    def increment_broken_links(db: Session, job_id: UUID) -> Optional[CrawlJob]:
-        """Increment broken links counter"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            job.total_broken_links += 1
-            db.commit()
-            db.refresh(job)
-        return job
+    def increment_links_found(es: Elasticsearch, job_id: str, count: int = 1) -> None:
+        es.update(
+            index=CRAWL_JOBS_INDEX,
+            id=job_id,
+            script={
+                "source": "ctx._source.total_links_found += params.count",
+                "lang": "painless",
+                "params": {"count": count},
+            },
+        )
 
     @staticmethod
-    def delete(db: Session, job_id: UUID) -> bool:
-        """Delete a job (cascades to related records)"""
-        job = db.query(CrawlJob).filter(CrawlJob.id == job_id).first()
-        if job:
-            db.delete(job)
-            db.commit()
+    def increment_broken_links(es: Elasticsearch, job_id: str) -> None:
+        es.update(
+            index=CRAWL_JOBS_INDEX,
+            id=job_id,
+            script={"source": "ctx._source.total_broken_links += 1", "lang": "painless"},
+        )
+
+    @staticmethod
+    def delete(es: Elasticsearch, job_id: str) -> bool:
+        try:
+            es.delete(index=CRAWL_JOBS_INDEX, id=job_id, refresh=True)
             return True
-        return False
+        except NotFoundError:
+            return False
