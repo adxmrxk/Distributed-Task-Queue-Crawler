@@ -46,32 +46,34 @@ export default function JobPage() {
   const [brokenLinks, setBrokenLinks] = useState<BrokenLink[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 5;
 
   const isActive = (status?: Job["status"]) =>
     status === "PENDING" || status === "IN_PROGRESS";
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (currentPage = 0) => {
     try {
       const j = await getJob(id);
       setJob(j);
       if (j.status === "COMPLETED" || j.total_broken_links > 0) {
-        const bl = await getBrokenLinks(id);
-        setBrokenLinks(bl.broken_links);
+        const bl = await getBrokenLinks(id, currentPage * PAGE_SIZE, PAGE_SIZE);
+        setBrokenLinks(bl.broken_links ?? []);
       }
     } catch {
       setError("Could not load job. It may not exist.");
     }
-  }, [id]);
+  }, [id, PAGE_SIZE]);
 
   // Initial fetch + polling while active
   useEffect(() => {
-    fetchData();
+    fetchData(page);
     const interval = setInterval(() => {
       if (!isActive(job?.status)) return;
-      fetchData();
+      fetchData(page);
     }, 2000);
     return () => clearInterval(interval);
-  }, [fetchData, job?.status]);
+  }, [fetchData, job?.status, page]);
 
   async function handleCancel() {
     if (!job) return;
@@ -220,6 +222,31 @@ export default function JobPage() {
               </tbody>
             </table>
           </div>
+
+          {/* Pagination */}
+          {job.total_broken_links > PAGE_SIZE && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-zinc-500">
+                Page {page + 1} of {Math.ceil(job.total_broken_links / PAGE_SIZE)}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPage(p => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                  className="px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white hover:border-zinc-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => setPage(p => p + 1)}
+                  disabled={(page + 1) * PAGE_SIZE >= job.total_broken_links}
+                  className="px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white hover:border-zinc-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
