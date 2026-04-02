@@ -112,7 +112,7 @@ class PlaywrightCrawler:
                 status = response.status
                 content_type = response.headers.get('content-type', '')
 
-                # Extract all links using JavaScript
+                # Extract all links and page text content using JavaScript
                 links = await page.evaluate('''() => {
                     const anchors = document.querySelectorAll('a[href]');
                     return Array.from(anchors).map(a => ({
@@ -120,6 +120,13 @@ class PlaywrightCrawler:
                         text: a.textContent.trim().substring(0, 200),  // Limit text length
                         rel: a.rel || ''
                     })).filter(link => link.href);  // Filter out empty hrefs
+                }''')
+
+                content = await page.evaluate('''() => {
+                    const clone = document.body ? document.body.cloneNode(true) : null;
+                    if (!clone) return '';
+                    clone.querySelectorAll('script, style, nav, footer, header').forEach(el => el.remove());
+                    return (clone.innerText || '').replace(/\\s+/g, ' ').trim().substring(0, 50000);
                 }''')
 
                 logger.info(
@@ -136,6 +143,7 @@ class PlaywrightCrawler:
                     'url': final_url,
                     'status': status,
                     'title': title,
+                    'content': content,
                     'links': links,
                     'error': None,
                     'content_type': content_type

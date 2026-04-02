@@ -16,10 +16,11 @@ class Settings(BaseSettings):
     APP_NAME: str = "Distributed Web Crawler"
     DEBUG: bool = False
 
-    # Database
-    DATABASE_URL: str
-    DB_POOL_SIZE: int = 20
-    DB_MAX_OVERFLOW: int = 40
+    # Elasticsearch
+    ELASTICSEARCH_URL: str = "http://localhost:9200"
+
+    # Kafka
+    KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
 
     # Redis
     REDIS_URL: str
