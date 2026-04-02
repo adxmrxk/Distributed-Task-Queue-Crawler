@@ -3,7 +3,7 @@ name = "distributed-crawler"
 version = "1.0.0"
 description = "Production-grade distributed web crawler with Celery and Playwright"
 authors = ["Your Name <your.email@example.com>"]
-readme = "README.md"
+package-mode = false
 packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
@@ -14,9 +14,8 @@ celery = "^5.3.6"
 redis = "^5.0.1"
 playwright = "^1.41.0"
 aiohttp = "^3.9.3"
-sqlalchemy = "^2.0.25"
-alembic = "^1.13.1"
-psycopg2-binary = "^2.9.9"
+elasticsearch = "^8.12.0"
+confluent-kafka = "^2.3.0"
 pydantic = "^2.6.0"
 pydantic-settings = "^2.1.0"
 python-json-logger = "^2.0.7"
