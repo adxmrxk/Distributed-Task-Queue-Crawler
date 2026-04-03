@@ -71,6 +71,10 @@ func (c *Checker) doRequest(method, url string) CheckResult {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
+		// 403/429 means the server is blocking the bot, not that the link is broken
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			return CheckResult{URL: url, IsValid: true, StatusCode: resp.StatusCode}
+		}
 		return CheckResult{
 			URL:          url,
 			IsValid:      false,
@@ -95,12 +99,34 @@ func (c *Checker) CheckBatch(urls []string, maxConcurrent int) []CheckResult {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[idx] = c.Check(u)
+			results[idx] = c.CheckWithRetry(u, 2)
 		}(i, url)
 	}
 
 	wg.Wait()
 	return results
+}
+
+// CheckWithRetry retries transient failures (TIMEOUT, CONNECTION_ERROR) with
+// exponential backoff. Permanent failures (DNS errors, HTTP 4xx/5xx) are not retried.
+func (c *Checker) CheckWithRetry(url string, maxRetries int) CheckResult {
+	result := c.Check(url)
+	if result.IsValid {
+		return result
+	}
+	// Only retry transient network errors, not permanent failures
+	if result.ErrorType != "TIMEOUT" && result.ErrorType != "CONNECTION_ERROR" {
+		return result
+	}
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		backoff := time.Duration(attempt*attempt) * 500 * time.Millisecond
+		time.Sleep(backoff)
+		result = c.Check(url)
+		if result.IsValid || (result.ErrorType != "TIMEOUT" && result.ErrorType != "CONNECTION_ERROR") {
+			return result
+		}
+	}
+	return result
 }
 
 func classifyNetError(url string, err error) CheckResult {

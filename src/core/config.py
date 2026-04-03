@@ -49,5 +49,19 @@ class Settings(BaseSettings):
     DLQ_ENABLED: bool = True
     DLQ_ALERT_WEBHOOK: Optional[str] = None
 
+    # Auth — JWT
+    # Generate a secret: python -c "import secrets; print(secrets.token_hex(32))"
+    JWT_SECRET_KEY: str = "change-me-in-production-use-a-long-random-string"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 60
+
+    # Auth — credentials
+    # Generate hash: python -c "from passlib.hash import bcrypt; print(bcrypt.hash('yourpassword'))"
+    ADMIN_USERNAME: str = "admin"
+    ADMIN_PASSWORD_HASH: str = "$2b$12$placeholder-replace-with-real-bcrypt-hash"
+
+    # Auth — API key for programmatic access (optional)
+    API_KEY: Optional[str] = None
+
 
 settings = Settings()

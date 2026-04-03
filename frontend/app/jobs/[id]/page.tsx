@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { getJob, getBrokenLinks, cancelJob, type Job, type BrokenLink } from "@/lib/api";
+import { useToast } from "@/components/toast";
 
 const STATUS_COLOR: Record<Job["status"], string> = {
   PENDING:     "bg-yellow-500/15 text-yellow-400 border-yellow-500/25",
@@ -42,6 +43,8 @@ export default function JobPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
 
+  const { showToast } = useToast();
+
   const [job, setJob] = useState<Job | null>(null);
   const [brokenLinks, setBrokenLinks] = useState<BrokenLink[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -55,7 +58,25 @@ export default function JobPage() {
   const fetchData = useCallback(async (currentPage = 0) => {
     try {
       const j = await getJob(id);
-      setJob(j);
+      setJob(prev => {
+        const was = prev?.status;
+        const wasActive = was === "PENDING" || was === "IN_PROGRESS";
+        if (wasActive && was !== j.status) {
+          if (j.status === "COMPLETED") {
+            showToast(
+              j.total_broken_links > 0
+                ? `Crawl complete - ${j.total_broken_links} broken link${j.total_broken_links !== 1 ? "s" : ""} found`
+                : "Crawl complete - no broken links found!",
+              j.total_broken_links > 0 ? "error" : "success"
+            );
+          } else if (j.status === "FAILED") {
+            showToast("Crawl failed", "error");
+          } else if (j.status === "CANCELLED") {
+            showToast("Job cancelled", "info");
+          }
+        }
+        return j;
+      });
       if (j.status === "COMPLETED" || j.total_broken_links > 0) {
         const bl = await getBrokenLinks(id, currentPage * PAGE_SIZE, PAGE_SIZE);
         setBrokenLinks(bl.broken_links ?? []);
@@ -63,7 +84,7 @@ export default function JobPage() {
     } catch {
       setError("Could not load job. It may not exist.");
     }
-  }, [id, PAGE_SIZE]);
+  }, [id, PAGE_SIZE, showToast]);
 
   // Initial fetch + polling while active
   useEffect(() => {

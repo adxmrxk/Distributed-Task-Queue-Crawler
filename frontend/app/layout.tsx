@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Link from "next/link";
+import { ToastProvider } from "@/components/toast";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -26,6 +27,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-zinc-950 text-zinc-100 min-h-screen`}>
+        <ToastProvider>
         <header className="border-b border-zinc-800 px-6 py-4">
           <div className="max-w-5xl mx-auto flex items-center justify-between">
             <Link href="/" className="flex items-center gap-2 font-semibold text-white hover:text-zinc-300 transition-colors">
@@ -45,6 +47,7 @@ export default function RootLayout({
         <main className="max-w-5xl mx-auto px-6 py-10">
           {children}
         </main>
+        </ToastProvider>
       </body>
     </html>
   );

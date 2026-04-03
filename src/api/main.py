@@ -2,9 +2,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from prometheus_fastapi_instrumentator import Instrumentator
 import logging
 
 from src.api.routes import health, jobs, results, search
+from src.api.metrics import pages_crawled_total, broken_links_total, crawl_duration_seconds, active_jobs  # noqa: F401 — registers metrics
 from src.core.logging import setup_logging
 from src.core.config import settings
 from src.db.elasticsearch_client import get_es_client
@@ -37,6 +39,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 @app.exception_handler(RequestValidationError)

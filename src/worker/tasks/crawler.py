@@ -19,6 +19,7 @@ from src.utils.url_utils import normalize_url, get_domain
 from src.core.constants import JobStatus
 from src.core.config import settings
 from src.core.exceptions import RobotsTxtDeniedException, CrawlTimeoutException
+from src.api.metrics import pages_crawled_total, crawl_duration_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,10 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
             async with PlaywrightCrawler() as crawler:
                 return await crawler.crawl_page(url)
 
+        import time as _time
+        _t0 = _time.monotonic()
         result = asyncio.run(crawl())
+        crawl_duration_seconds.observe(_time.monotonic() - _t0)
 
         # Index the page into Elasticsearch (whether or not there was an error)
         LinkRepository.create_visited_url(
@@ -104,6 +108,7 @@ def crawl_url(self, job_id: str, url: str, depth: int = 0):
 
         JobRepository.increment_pages_crawled(es_client, job_id)
         JobRepository.increment_links_found(es_client, job_id, len(result['links']))
+        pages_crawled_total.labels(job_id=job_id).inc()
         # Update last activity timestamp for completion detection
         import time
         redis_client.set(f"last_activity:{job_id}", str(time.time()), ex=3600)

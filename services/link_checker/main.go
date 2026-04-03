@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -23,6 +24,11 @@ func main() {
 	topic := getEnv("KAFKA_TOPIC", "link_check_jobs")
 	groupID := getEnv("KAFKA_GROUP_ID", "link-checker-group")
 	esURL := getEnv("ELASTICSEARCH_URL", "http://localhost:9200")
+	metricsAddr := getEnv("METRICS_ADDR", ":9091")
+	concurrency := getEnvInt("LINK_CHECKER_CONCURRENCY", 50)
+
+	startMetricsServer(metricsAddr)
+	log.Printf("Metrics server listening on %s", metricsAddr)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        []string{brokers},
@@ -38,7 +44,8 @@ func main() {
 	esClient := NewESClient(esURL)
 	checker := NewChecker()
 
-	log.Printf("Go link checker started — broker: %s, topic: %s, group: %s", brokers, topic, groupID)
+	log.Printf("Go link checker started — broker: %s, topic: %s, group: %s, concurrency: %d",
+		brokers, topic, groupID, concurrency)
 
 	ctx := context.Background()
 	for {
@@ -55,21 +62,31 @@ func main() {
 			continue
 		}
 
+		kafkaMessagesTotal.Inc()
+
 		// Each job processed in its own goroutine — consumer loop never blocks.
-		go processJob(ctx, job, checker, esClient)
+		goroutinesActive.Inc()
+		go func(j LinkCheckJob) {
+			defer goroutinesActive.Dec()
+			processJob(ctx, j, checker, esClient, concurrency)
+		}(job)
 	}
 }
 
-func processJob(ctx context.Context, job LinkCheckJob, checker *Checker, es *ESClient) {
+func processJob(ctx context.Context, job LinkCheckJob, checker *Checker, es *ESClient, concurrency int) {
 	log.Printf("Checking %d links for job %s (source: %s)", len(job.TargetURLs), job.JobID, job.SourceURL)
 
-	results := checker.CheckBatch(job.TargetURLs, 50)
+	results := checker.CheckBatch(job.TargetURLs, concurrency)
+
+	urlsCheckedTotal.Add(float64(len(results)))
 
 	broken := 0
 	for _, r := range results {
 		if r.IsValid {
 			continue
 		}
+
+		urlsBrokenTotal.WithLabelValues(r.ErrorType).Inc()
 
 		doc := BrokenLinkDoc{
 			JobID:        job.JobID,
@@ -100,6 +117,15 @@ func processJob(ctx context.Context, job LinkCheckJob, checker *Checker, es *ESC
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }

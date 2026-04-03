@@ -92,6 +92,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       APP_NAME: "Distributed Web Crawler"
       DEBUG: "False"
+    env_file:
+      - .env
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -164,12 +166,54 @@ services:
     networks:
       - crawler_network
 
+  celery-exporter:
+    image: danihodovic/celery-exporter:0.10.0
+    container_name: crawler_celery_exporter
+    command: --broker-url=redis://redis:6379/0
+    ports:
+      - "9540:9540"
+    depends_on:
+      - redis
+    networks:
+      - crawler_network
+
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: crawler_prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - celery-exporter
+    networks:
+      - crawler_network
+
+  grafana:
+    image: grafana/grafana:10.3.1
+    container_name: crawler_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - crawler_network
+
 volumes:
   elasticsearch_data:
   redis_data:
   zookeeper_data:
   zookeeper_log:
   kafka_data:
+  grafana_data:
 
 networks:
   crawler_network:
