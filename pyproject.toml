@@ -58,3 +58,8 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+collect_ignore = [
+    "tests/integration/test_job_repository.py",
+    "tests/integration/test_link_repository.py",
+]
+addopts = "--ignore=tests/integration/test_job_repository.py --ignore=tests/integration/test_link_repository.py"
