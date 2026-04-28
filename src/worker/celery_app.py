@@ -83,6 +83,5 @@ app.conf.update(
 )
 
 # Import tasks to register them
-from src.worker.tasks import crawler
 
 __all__ = ['app']

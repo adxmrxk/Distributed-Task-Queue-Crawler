@@ -1,6 +1,4 @@
 """Unit tests for src/utils/retry_utils.py"""
-import pytest
-from unittest.mock import patch
 from src.utils.retry_utils import calculate_exponential_backoff, should_retry
 
 

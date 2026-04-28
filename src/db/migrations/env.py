@@ -10,14 +10,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 # Import all models
 from src.db.base import Base
-from src.db.models import (
-    CrawlJob,
-    BrokenLink,
-    TaskMetadata,
-    RetryHistory,
-    DeadLetterQueue,
-    VisitedUrl
-)
 from src.core.config import settings
 
 # this is the Alembic Config object

@@ -1,6 +1,6 @@
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Error as PlaywrightError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Error as PlaywrightError
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 import logging
 from src.core.config import settings
 from src.core.exceptions import PlaywrightException, CrawlTimeoutException

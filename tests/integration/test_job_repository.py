@@ -7,7 +7,7 @@ without requiring a live database.
 """
 import pytest
 from datetime import datetime
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 from src.db.repositories.job_repository import JobRepository
@@ -43,7 +43,7 @@ def existing_job():
 
 class TestJobRepositoryCreate:
     def test_adds_and_commits(self, db):
-        job = JobRepository.create(db, url="https://example.com")
+        JobRepository.create(db, url="https://example.com")
         db.add.assert_called_once()
         db.commit.assert_called_once()
         db.refresh.assert_called_once()

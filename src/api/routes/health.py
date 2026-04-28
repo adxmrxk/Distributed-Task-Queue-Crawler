@@ -24,7 +24,6 @@ async def readiness_check():
         "celery": await check_celery()
     }
     all_healthy = all(checks.values())
-    status_code = status.HTTP_200_OK if all_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
     return {"ready": all_healthy, "checks": checks}
 
 

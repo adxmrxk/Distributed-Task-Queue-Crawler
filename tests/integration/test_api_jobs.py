@@ -4,12 +4,10 @@ Integration tests for the FastAPI jobs router.
 Uses FastAPI's TestClient with the database dependency overridden to a mock
 session and Celery task dispatch patched out, so no live services are needed.
 """
-import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
 
 from src.core.constants import JobStatus
 

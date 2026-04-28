@@ -10,7 +10,6 @@ from src.worker.tasks.crawler import crawl_url
 from src.core.constants import JobStatus
 from src.utils.url_utils import validate_url
 from src.worker.celery_app import app as celery_app
-from src.core.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

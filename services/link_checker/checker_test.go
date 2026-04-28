@@ -84,7 +84,8 @@ func TestCheck_HeadFallbackToGet(t *testing.T) {
 
 func TestCheck_InvalidURL(t *testing.T) {
 	c := NewChecker()
-	result := c.Check("not-a-url")
+	// Control character in URL fails http.NewRequest at parse time
+	result := c.Check("http://example.com/\x7f")
 
 	if result.IsValid {
 		t.Error("expected invalid for malformed URL")

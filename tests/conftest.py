@@ -11,7 +11,6 @@ os.environ["CELERY_BROKER_URL"] = "redis://localhost:6379/15"
 os.environ["CELERY_RESULT_BACKEND"] = "redis://localhost:6379/14"
 
 import pytest
-from datetime import datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 

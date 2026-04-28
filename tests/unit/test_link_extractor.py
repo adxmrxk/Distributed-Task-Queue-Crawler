@@ -1,5 +1,4 @@
 """Unit tests for src/crawler/link_extractor.py"""
-import pytest
 from src.crawler.link_extractor import LinkExtractor
 
 

@@ -1,8 +1,5 @@
 from celery import Task
-from celery.exceptions import Reject
 import logging
-from datetime import datetime
-from typing import Optional
 from src.core.config import settings
 from src.utils.retry_utils import calculate_exponential_backoff
 from src.db.elasticsearch_client import es_client
