@@ -89,7 +89,7 @@ grafana/            # Dashboard JSON
 
 ## Notes
 
-- Tuned for ~2-6 pages/sec with default settings (Playwright is slow on purpose — it waits for the full page to render)
+- Tuned for ~2-6 pages/sec with default settings (Playwright is slow on purpose, it waits for the full page to render)
 - The Go link checker handles 100-300 URLs/sec
-- 403/429 responses don't count as broken links — those mean the site is blocking bots, not that the link is dead
+- 403/429 responses don't count as broken links, those mean the site is blocking bots, not that the link is dead
 - Set `CRAWLER_MAX_DEPTH` and `CRAWLER_MAX_PAGES` in `.env` to control crawl scope
