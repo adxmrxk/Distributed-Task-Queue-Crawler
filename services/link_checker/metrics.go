@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,7 +46,7 @@ func startMetricsServer(addr string) {
 	})
 	go func() {
 		if err := http.ListenAndServe(addr, mux); err != nil {
-			// Non-fatal: metrics unavailability should not crash the service
+			log.Printf("metrics server stopped: %v", err)
 		}
 	}()
 }

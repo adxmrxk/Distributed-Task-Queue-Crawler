@@ -47,6 +47,11 @@ func NewChecker() *Checker {
 
 // Check validates a single URL. Uses HEAD; falls back to GET on 405.
 func (c *Checker) Check(url string) CheckResult {
+	start := time.Now()
+	defer func() {
+		checkDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
+
 	result := c.doRequest("HEAD", url)
 
 	// Some servers don't support HEAD — retry with GET.
