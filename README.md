@@ -1,316 +1,95 @@
-# Distributed Task Queue Web Crawler
+# Distributed Web Crawler
 
-A production-grade distributed web crawler built with Python, Celery, Playwright, PostgreSQL, and Redis. Features broken link detection, full browser automation with JavaScript rendering, dead letter queue for failed tasks, and exponential backoff retry logic.
+A web crawler that finds broken links on any site. Submit a URL, it crawls the whole site, validates every external link, and reports back which ones are dead.
 
-## Features
+Built it to learn distributed systems — Python handles the crawling, a separate Go service validates external links in parallel, and everything talks to each other through Kafka and Redis.
 
-- **Full Browser Automation**: Uses Playwright to handle JavaScript-heavy sites and SPAs
-- **Distributed Architecture**: Celery workers with Redis broker for horizontal scalability
-- **Broken Link Detection**: Efficiently finds and reports broken links across websites
-- **Production-Ready Error Handling**:
-  - Exponential backoff with jitter
-  - Dead Letter Queue (DLQ) for permanently failed tasks
-  - Comprehensive retry logic
-- **Rate Limiting**: Per-domain token bucket algorithm to respect target sites
-- **Politeness**: Respects robots.txt and crawl-delay directives
-- **RESTful API**: FastAPI endpoints for job submission and status tracking
-- **Monitoring**: Flower dashboard for real-time Celery task monitoring
-- **Docker Deployment**: Complete containerized setup with docker-compose
+## What's in it
 
-## Architecture
+- **FastAPI** for the HTTP API
+- **Celery + Redis** for the task queue
+- **Playwright** to handle JavaScript-heavy sites
+- **Kafka** to hand off external link validation to a Go microservice
+- **Go service** with 50 goroutines validating URLs in parallel
+- **Elasticsearch** for storage and full-text search across crawled pages
+- **Next.js** frontend with live progress and a Grafana dashboard for metrics
 
-**Components:**
-- **API Layer** (FastAPI): Job submission, status queries, result retrieval
-- **Task Queue** (Celery + Redis): Distributed task processing with reliability guarantees
-- **Crawler Engine** (Playwright): Browser automation for JavaScript rendering
-- **Database** (PostgreSQL): Persistent storage for jobs, results, and task metadata
-- **Cache/Broker** (Redis): Message queue and distributed rate limiting
+## Run it
 
-**Crawling Strategy:**
-- Breadth-First Search (BFS) for efficient parallel processing
-- Configurable depth and page limits
-- URL deduplication with SHA256 hashing
-- Per-domain rate limiting with token bucket algorithm
+You need Docker. That's it.
 
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- Docker and Docker Compose
-- Poetry (Python dependency management)
-
-### Local Development
-
-1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd distributed-crawler
+docker-compose up -d
 ```
 
-2. Copy environment variables:
+Then open the frontend (run separately):
+
 ```bash
-cp .env.example .env
+cd frontend
+npm install
+npm run dev
 ```
 
-3. Install dependencies:
-```bash
-poetry install
-```
+Frontend is at `localhost:3000`, API at `localhost:8000/docs`, Grafana at `localhost:3001`.
 
-4. Start infrastructure (PostgreSQL, Redis):
-```bash
-docker-compose up -d postgres redis
-```
+## How it works
 
-5. Run database migrations:
-```bash
-poetry run alembic upgrade head
-```
+1. Submit a URL through the UI
+2. A Celery worker crawls it with a real browser (Playwright), extracts every link
+3. Internal links get queued for further crawling (BFS, configurable depth/page limits)
+4. External links get pushed to Kafka, where the Go service picks them up and validates them
+5. Broken links and full page content land in Elasticsearch
+6. The frontend polls every 2s for live progress and fires a toast when the job finishes
 
-6. Start the API:
-```bash
-poetry run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
-```
+Per-domain rate limiting (Redis token bucket), robots.txt support, exponential backoff retries, and a dead letter queue keep things polite and resilient.
 
-7. Start Celery workers:
-```bash
-poetry run celery -A src.worker.celery_app worker --loglevel=info --concurrency=4
-```
-
-8. (Optional) Start Flower for monitoring:
-```bash
-poetry run celery -A src.worker.celery_app flower --port=5555
-```
-
-### Docker Deployment
-
-1. Build and start all services:
-```bash
-docker-compose up --build
-```
-
-2. Access the services:
-   - API: http://localhost:8000
-   - API Docs: http://localhost:8000/docs
-   - Flower Dashboard: http://localhost:5555
-
-## API Usage
-
-### Submit a Crawl Job
+## Hitting the API directly
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/jobs \
+# Submit a job
+curl -X POST localhost:8000/api/v1/jobs \
   -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://example.com",
-    "max_depth": 3,
-    "max_pages": 100,
-    "respect_robots_txt": true
-  }'
+  -d '{"url": "https://example.com", "max_depth": 3, "max_pages": 100}'
+
+# Check status
+curl localhost:8000/api/v1/jobs/{job_id}
+
+# Get broken links
+curl localhost:8000/api/v1/results/{job_id}/broken-links
+
+# Search across all crawled pages
+curl "localhost:8000/api/v1/search?q=keyword"
 ```
 
-Response:
-```json
-{
-  "id": "123e4567-e89b-12d3-a456-426614174000",
-  "url": "https://example.com",
-  "status": "IN_PROGRESS",
-  "celery_task_id": "abc123...",
-  "created_at": "2026-03-14T10:30:00Z"
-}
-```
+Full docs at `localhost:8000/docs`.
 
-### Check Job Status
+## Tests
 
 ```bash
-curl http://localhost:8000/api/v1/jobs/{job_id}
-```
-
-Response:
-```json
-{
-  "id": "123e4567-e89b-12d3-a456-426614174000",
-  "url": "https://example.com",
-  "status": "COMPLETED",
-  "total_pages_crawled": 42,
-  "total_links_found": 315,
-  "total_broken_links": 5,
-  "started_at": "2026-03-14T10:30:01Z",
-  "completed_at": "2026-03-14T10:32:15Z"
-}
-```
-
-### Get Broken Links
-
-```bash
-curl http://localhost:8000/api/v1/jobs/{job_id}/broken-links?skip=0&limit=100
-```
-
-Response:
-```json
-{
-  "total": 5,
-  "broken_links": [
-    {
-      "source_url": "https://example.com/page1",
-      "broken_url": "https://example.com/404",
-      "anchor_text": "Click here",
-      "status_code": 404,
-      "error_type": "HTTP_ERROR",
-      "depth": 1
-    }
-  ]
-}
-```
-
-### Cancel a Job
-
-```bash
-curl -X DELETE http://localhost:8000/api/v1/jobs/{job_id}
-```
-
-## Project Structure
-
-```
-distributed-crawler/
-├── src/
-│   ├── api/              # FastAPI application
-│   ├── worker/           # Celery workers and tasks
-│   ├── crawler/          # Playwright crawler and validators
-│   ├── db/               # Database models and repositories
-│   ├── core/             # Configuration, logging, exceptions
-│   └── utils/            # Utility functions
-├── docker/               # Dockerfiles
-├── scripts/              # Utility scripts
-├── tests/                # Test suite
-├── docker-compose.yml    # Service orchestration
-└── pyproject.toml        # Python dependencies
-```
-
-## Configuration
-
-All configuration is managed through environment variables. See `.env.example` for available options.
-
-Key configurations:
-- `DATABASE_URL`: PostgreSQL connection string
-- `CELERY_BROKER_URL`: Redis broker URL
-- `CRAWLER_MAX_DEPTH`: Maximum crawl depth (default: 3)
-- `CRAWLER_RATE_LIMIT_PER_DOMAIN`: Requests per second per domain (default: 1.0)
-- `RETRY_MAX_ATTEMPTS`: Maximum retry attempts (default: 5)
-
-## Monitoring
-
-### Flower Dashboard
-
-Access Flower at http://localhost:5555 to monitor:
-- Active tasks and workers
-- Task success/failure rates
-- Worker status and health
-- Task arguments and results
-- Queue depth and throughput
-
-### Health Checks
-
-- `GET /health`: Basic liveness check
-- `GET /ready`: Readiness check (database, redis, workers)
-
-### Logging
-
-Structured JSON logging with the following fields:
-- `timestamp`: ISO 8601 timestamp
-- `level`: Log level (INFO, WARNING, ERROR)
-- `message`: Log message
-- `job_id`, `task_id`, `url`, `depth`: Contextual metadata
-
-## Testing
-
-Run the full test suite:
-```bash
+# Python
 poetry run pytest
+
+# Go
+cd services/link_checker && go test ./...
 ```
 
-Run with coverage:
-```bash
-poetry run pytest --cov=src --cov-report=html
+CI runs both on every push.
+
+## Layout
+
+```
+src/                # Python — FastAPI + Celery + crawler
+services/link_checker/   # Go — Kafka consumer + URL validator
+frontend/           # Next.js UI
+k8s/                # Kubernetes manifests
+prometheus/         # Scrape config
+grafana/            # Dashboard JSON
+.github/workflows/  # CI/CD
 ```
 
-Run specific test types:
-```bash
-poetry run pytest tests/unit/          # Unit tests
-poetry run pytest tests/integration/   # Integration tests
-poetry run pytest tests/e2e/           # End-to-end tests
-```
+## Notes
 
-## Production Deployment
-
-### Scaling Workers
-
-Adjust worker replicas in `docker-compose.yml`:
-```yaml
-worker:
-  deploy:
-    replicas: 10  # Scale to 10 workers
-```
-
-Or scale dynamically:
-```bash
-docker-compose up --scale worker=10
-```
-
-### Performance Tuning
-
-- **Worker Concurrency**: Adjust `--concurrency` flag (default: 4)
-- **Rate Limiting**: Tune `CRAWLER_RATE_LIMIT_PER_DOMAIN` per target site requirements
-- **Database Connection Pool**: Adjust `DB_POOL_SIZE` and `DB_MAX_OVERFLOW`
-- **Redis Max Connections**: Tune `REDIS_MAX_CONNECTIONS`
-
-### Security Considerations
-
-1. **Input Validation**: All URLs validated to prevent SSRF attacks
-2. **Rate Limiting**: API rate limiting to prevent abuse
-3. **Authentication**: Add API key authentication for production
-4. **Network Isolation**: Workers in separate Docker network
-5. **Secrets Management**: Use Docker secrets or environment injection
-6. **Non-Root Containers**: All containers run as non-root users
-
-## Troubleshooting
-
-### Dead Letter Queue
-
-Monitor failed tasks:
-```bash
-poetry run python scripts/monitor_dlq.py
-```
-
-### Database Migrations
-
-Create a new migration:
-```bash
-poetry run alembic revision --autogenerate -m "Description"
-```
-
-Apply migrations:
-```bash
-poetry run alembic upgrade head
-```
-
-Rollback migration:
-```bash
-poetry run alembic downgrade -1
-```
-
-### Worker Debugging
-
-Increase log level:
-```bash
-poetry run celery -A src.worker.celery_app worker --loglevel=debug
-```
-
-## License
-
-MIT License
-
-## Contributing
-
-Contributions welcome! Please submit issues and pull requests.
+- Tuned for ~2-6 pages/sec with default settings (Playwright is slow on purpose — it waits for the full page to render)
+- The Go link checker handles 100-300 URLs/sec
+- 403/429 responses don't count as broken links — those mean the site is blocking bots, not that the link is dead
+- Set `CRAWLER_MAX_DEPTH` and `CRAWLER_MAX_PAGES` in `.env` to control crawl scope
