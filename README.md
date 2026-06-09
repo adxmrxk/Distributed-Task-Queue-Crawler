@@ -16,9 +16,6 @@ Submit a URL, the system crawls the whole site with a real browser, validates ev
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
-- [CI/CD Pipeline](#cicd-pipeline)
-- [Observability](#observability)
-- [Performance and Limits](#performance-and-limits)
 
 ---
 
@@ -106,14 +103,6 @@ The system runs as a multi-stage pipeline. Each stage is independently scalable.
         │  Live progress, results, full-text search     │
         └──────────────────────────────────────────────┘
 ```
-
-**Key design decisions:**
-
-- **The crawler is decoupled from the link checker.** They communicate only through Kafka, which means each can crash, scale, or be rewritten independently. The Go service can be removed entirely and the Python side keeps working (links just don't get validated).
-- **Playwright for rendering, not raw HTTP.** Modern sites render content client-side. A `requests.get()` crawler misses everything inside `<div id="root"></div>`. Playwright costs throughput but gives correctness on real-world pages.
-- **Go for the link checker, Python for everything else.** Go's goroutines and standard `net/http` library validate hundreds of URLs per second per process. Python's `asyncio` could match this but Go is more honest about the workload.
-- **Elasticsearch for storage and search.** A crawl produces unstructured page content that users want to query. Elasticsearch handles both storage and full-text search in one system; using Postgres would have required a separate search index anyway.
-- **Redis is the single connective backbone.** Celery broker, result backend, rate limiter token buckets, and ephemeral state all live there. One service to operate.
 
 ---
 
@@ -520,83 +509,3 @@ All configuration is via environment variables, defined in `.env`. Copy `.env.ex
 | `RETRY_BACKOFF_MAX`    | Backoff cap (seconds)                    | `600`   |
 | `DLQ_ENABLED`          | Capture exhausted tasks                  | `True`  |
 | `DLQ_ALERT_WEBHOOK`    | Optional webhook for DLQ events          | (none)  |
-
----
-
-## CI/CD Pipeline
-
-The GitHub Actions workflows in `.github/workflows/` run on every push:
-
-| Workflow      | Purpose |
-|---------------|---------|
-| `test.yml`    | Runs `pytest` for Python and `go test ./...` for the Go link checker. Includes coverage reporting. |
-| `docker.yml`  | Builds and publishes container images for the API, worker, and link checker. |
-
-Run tests locally:
-
-```bash
-# Python
-poetry run pytest
-
-# Go
-cd services/link_checker && go test ./...
-```
-
----
-
-## Observability
-
-### Metrics
-
-Both the Python API and the Go link checker expose Prometheus-formatted metrics:
-
-- `crawler_pages_crawled_total`
-- `crawler_links_discovered_total`
-- `crawler_broken_links_total`
-- `crawler_request_duration_seconds`
-- `link_check_duration_seconds` (Go service)
-- Celery queue depth and task latency via `celery-exporter`
-
-### Dashboards
-
-A pre-built Grafana dashboard is provisioned automatically at startup. It includes:
-
-- Pages crawled per second
-- Broken links discovered over time
-- Celery task latency percentiles
-- Queue depth per worker
-- HTTP error rate by domain
-
-### Task Inspection
-
-Flower runs at http://localhost:5555 for live Celery task inspection: see what's currently being processed, retry counts, task arguments, and error tracebacks.
-
-### Logging
-
-All Python services log JSON-formatted records via `python-json-logger`, ready for ingestion into log aggregation systems.
-
----
-
-## Performance and Limits
-
-Measured throughput on a single developer machine with default settings:
-
-| Stage              | Throughput              | Bottleneck |
-|--------------------|-------------------------|------------|
-| Page rendering     | 2 to 6 pages per second | Playwright (intentional: waits for full page render) |
-| Link extraction    | Negligible              | CPU-bound, fast |
-| External validation| 100 to 300 URLs per second per Go replica | Network I/O |
-| Elasticsearch writes | 1000+ docs per second | Indexing throughput |
-
-**Scaling levers:**
-
-- Increase Celery worker replicas in `docker-compose.yml` (default: 3)
-- Increase Go link checker replicas (default: 2, each with 50 goroutines)
-- Add Kafka partitions to the `link_check_jobs` topic for parallel consumer groups
-- Increase `CRAWLER_RATE_LIMIT_PER_DOMAIN` if you have permission to hit a target site harder
-
-**Operational notes:**
-
-- HTTP 403 and 429 responses are NOT counted as broken links. They mean the target is blocking automated traffic, not that the URL is dead.
-- Playwright is intentionally slow because it waits for the full page including async JavaScript to render. An HTTP-only crawler would be 10x faster but miss SPA content entirely.
-- The default crawl scope (depth 3, max 100 pages) is conservative. Override per-job in the API payload or globally in `.env`.
