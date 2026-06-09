@@ -1,28 +1,396 @@
 # Distributed Web Crawler
 
-A web crawler that finds broken links on any site. Submit a URL, it crawls the whole site, validates every external link, and reports back which ones are dead.
+**Production-grade distributed web crawler that finds broken links across an entire site.**
 
-Built it to learn distributed systems — Python handles the crawling, a separate Go service validates external links in parallel, and everything talks to each other through Kafka and Redis.
+Submit a URL, the system crawls the whole site with a real browser, validates every external link in parallel, and reports back which ones are dead. Built as a polyglot distributed system using Python for orchestration and Go for high-throughput URL validation, with Kafka and Redis as the connective tissue.
 
-## What's in it
+---
 
-- **FastAPI** for the HTTP API
-- **Celery + Redis** for the task queue
-- **Playwright** to handle JavaScript-heavy sites
-- **Kafka** to hand off external link validation to a Go microservice
-- **Go service** with 50 goroutines validating URLs in parallel
-- **Elasticsearch** for storage and full-text search across crawled pages
-- **Next.js** frontend with live progress and a Grafana dashboard for metrics
+## Table of Contents
 
-## Run it
+- [Project Overview](#project-overview)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Configuration](#configuration)
+- [CI/CD Pipeline](#cicd-pipeline)
+- [Observability](#observability)
+- [Performance and Limits](#performance-and-limits)
 
-You need Docker. That's it.
+---
+
+## Project Overview
+
+### What It Is
+
+A distributed web crawler designed as a horizontally scalable task pipeline. The Python side handles orchestration, JavaScript-aware page rendering, and result aggregation. The Go side does high-throughput external link validation. Kafka decouples the two so each can scale independently.
+
+The system exposes a REST API for submitting crawl jobs and querying results, plus a Next.js dashboard for live progress tracking and full-text search across crawled pages.
+
+### The Problem It Solves
+
+Broken links degrade user experience, hurt SEO rankings, and undermine trust. Manually auditing a website with thousands of pages and tens of thousands of outbound links is infeasible. Commercial site-audit tools work but are expensive and opaque.
+
+The technical challenges of doing this well are non-trivial:
+
+- **Modern sites are JavaScript-heavy.** A naive HTTP crawler misses anything rendered client-side.
+- **External link validation is the bottleneck.** A site with 10,000 outbound links to slow external hosts will take hours if validated sequentially.
+- **Politeness matters.** Hammering a single domain gets you rate-limited, blocked, or sued. Robots.txt and per-domain rate limits are required, not optional.
+- **Failure is the norm, not the exception.** Network timeouts, 5xx errors, JavaScript bombs, infinite redirect loops, and adversarial pages all need graceful handling.
+
+This project solves each of these problems with the right tool for the job: Playwright for rendering, Go goroutines for parallel HTTP validation, Redis token buckets for rate limiting, exponential backoff with a dead letter queue for resilience.
+
+### What It Does
+
+- Crawls a website breadth-first with configurable depth and page limits
+- Renders JavaScript using a headless browser so SPAs work correctly
+- Validates every external link in parallel via a Go microservice
+- Respects `robots.txt` and rate limits per domain
+- Stores all page content and broken-link findings in Elasticsearch with full-text search
+- Streams live progress to a Next.js dashboard
+- Exposes Prometheus metrics and a pre-built Grafana dashboard
+- Handles failures with exponential backoff retries and a dead letter queue
+
+---
+
+## How It Works
+
+The system runs as a multi-stage pipeline. Each stage is independently scalable.
+
+```
+        ┌────────────────────────────┐
+        │  Client (UI or API)        │
+        │  POST /api/v1/jobs         │
+        └──────────────┬─────────────┘
+                       ▼
+        ┌────────────────────────────┐
+        │  FastAPI                   │   Job intake, validation,
+        │  Creates job record        │   auth, REST endpoints
+        └──────────────┬─────────────┘
+                       ▼
+        ┌────────────────────────────┐
+        │  Celery (Redis broker)     │   Task queue with 3 workers
+        └──────────────┬─────────────┘
+                       ▼
+   1.  Crawler Worker (Python + Playwright)
+       • Fetches the page in a real browser
+       • Extracts every <a href> link
+       • Applies robots.txt and per-domain rate limits
+       • Classifies links as internal vs external
+                       │
+            ┌──────────┴──────────┐
+            ▼                     ▼
+   2.  Internal Links        3.  External Links
+       Re-queued in Celery       Pushed to Kafka topic
+       for further crawling      `link_check_jobs`
+       (BFS, depth-limited)
+                                  │
+                                  ▼
+                       ┌────────────────────────────┐
+                       │  Link Checker (Go)         │   2 replicas, 50
+                       │  Kafka consumer            │   goroutines each
+                       │  Parallel HTTP HEAD/GET    │
+                       └──────────────┬─────────────┘
+                                      ▼
+        ┌──────────────────────────────────────────────┐
+        │  Elasticsearch                                │
+        │  Pages, broken links, crawl metadata          │
+        └──────────────┬───────────────────────────────┘
+                       ▼
+        ┌──────────────────────────────────────────────┐
+        │  Next.js Frontend                             │
+        │  Polls /api/v1/jobs/{id} every 2s             │
+        │  Live progress, results, full-text search     │
+        └──────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+- **The crawler is decoupled from the link checker.** They communicate only through Kafka, which means each can crash, scale, or be rewritten independently. The Go service can be removed entirely and the Python side keeps working (links just don't get validated).
+- **Playwright for rendering, not raw HTTP.** Modern sites render content client-side. A `requests.get()` crawler misses everything inside `<div id="root"></div>`. Playwright costs throughput but gives correctness on real-world pages.
+- **Go for the link checker, Python for everything else.** Go's goroutines and standard `net/http` library validate hundreds of URLs per second per process. Python's `asyncio` could match this but Go is more honest about the workload.
+- **Elasticsearch for storage and search.** A crawl produces unstructured page content that users want to query. Elasticsearch handles both storage and full-text search in one system; using Postgres would have required a separate search index anyway.
+- **Redis is the single connective backbone.** Celery broker, result backend, rate limiter token buckets, and ephemeral state all live there. One service to operate.
+
+---
+
+## Architecture
+
+```
+                   ┌──────────────────────────────────────┐
+                   │           CLIENT LAYER               │
+                   │   Next.js UI  /  REST API consumers  │
+                   └─────────────────┬────────────────────┘
+                                     ▼
+                   ┌──────────────────────────────────────┐
+                   │           API LAYER                  │
+                   │   FastAPI (Uvicorn)                  │
+                   │   JWT auth, request validation       │
+                   └─────────────────┬────────────────────┘
+                                     ▼
+                   ┌──────────────────────────────────────┐
+                   │         TASK QUEUE LAYER             │
+                   │   Celery (Redis broker + backend)    │
+                   │   3 worker replicas, retry policy    │
+                   └─────────────────┬────────────────────┘
+                                     ▼
+       ┌─────────────────────────────────────────────────────┐
+       │                COMPUTE LAYER                         │
+       │  ┌─────────────────────┐   ┌──────────────────────┐ │
+       │  │  Crawler (Python)   │   │  Link Checker (Go)   │ │
+       │  │  Playwright + BFS   │   │  50 goroutines per   │ │
+       │  │  rate-limited fetch │   │  replica, Kafka cons │ │
+       │  └──────────┬──────────┘   └──────────┬───────────┘ │
+       └────────────┼─────────────────────────┼─────────────┘
+                    │                          │
+                    ▼                          ▼
+       ┌─────────────────────────────────────────────────────┐
+       │              MESSAGING LAYER                         │
+       │   Kafka (link_check_jobs)  +  Redis (Celery broker) │
+       └─────────────────────────────────────────────────────┘
+                              ▼
+       ┌─────────────────────────────────────────────────────┐
+       │                 DATA LAYER                           │
+       │   Elasticsearch (pages, broken links, metadata)      │
+       │   Redis (rate limiter token buckets, cache)          │
+       └─────────────────────────────────────────────────────┘
+
+       ┌─────────────────────────────────────────────────────┐
+       │             OBSERVABILITY LAYER                      │
+       │   Prometheus  ──▶  Grafana                           │
+       │   Flower (Celery)  /  celery-exporter                │
+       └─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Tech Stack
+
+### Application Runtime
+
+| Component       | Technology               | Why It's Used |
+|-----------------|--------------------------|---------------|
+| API             | **FastAPI + Uvicorn**    | Async-first, automatic OpenAPI docs at `/docs`, Pydantic validation for free |
+| Task queue      | **Celery 5 + Redis**     | Battle-tested Python task queue with retries, scheduling, and dead-letter handling |
+| Crawler         | **Playwright**           | Real browser rendering so JavaScript-heavy sites work; HTTP-only crawlers miss SPA content |
+| Link checker    | **Go 1.21**              | Goroutines make parallel HTTP validation trivial and fast; ~100 to 300 URLs/sec per replica |
+| Frontend        | **Next.js 14 + TypeScript** | App Router with React Server Components, Tailwind for styling |
+
+### Messaging and Queueing
+
+| Component  | Purpose |
+|------------|---------|
+| **Kafka**  | Decouples the Python crawler from the Go link checker. Topic `link_check_jobs` carries external URLs awaiting validation. Each service scales independently. |
+| **Redis**  | Celery broker and result backend for internal task distribution. Also stores rate limiter token buckets. |
+| **Zookeeper** | Kafka coordination (Confluent platform). |
+
+### Data and Storage
+
+| Component       | Purpose |
+|-----------------|---------|
+| **Elasticsearch** | Stores crawled page content, broken link findings, and job metadata. Provides full-text search across all crawled content via `/api/v1/search`. |
+| **Redis**         | Token bucket rate limiting per domain. Cache for parsed `robots.txt` to avoid re-fetching. |
+
+### Crawling and Politeness
+
+| Component                | Purpose |
+|--------------------------|---------|
+| **Playwright**           | Headless browser for JavaScript-aware page fetching |
+| **Robots.txt parser**    | Respects site crawl rules; configurable per-deployment |
+| **Redis token bucket**   | Per-domain rate limiting; default 1.0 req/sec/domain |
+| **Exponential backoff**  | Retries on 5xx and network errors with capped delays |
+| **Dead letter queue**    | Failed tasks after max retries are captured for inspection rather than lost |
+
+### Frontend
+
+| Component             | Purpose |
+|-----------------------|---------|
+| **Next.js 14**        | App Router, file-based routing, React Server Components |
+| **TypeScript**        | Type-safe API client and component props |
+| **Tailwind CSS**      | Utility-first styling, no design system overhead |
+| **Polling (2s)**      | Live job progress without WebSocket complexity |
+| **Toast notifications** | Job completion alerts |
+
+### Containers and Orchestration
+
+| Tool              | Purpose |
+|-------------------|---------|
+| **Docker**        | Multi-stage builds for API, worker, and link checker |
+| **Docker Compose**| Full local stack in one command |
+| **Kubernetes**    | Production manifests for each service with replicas |
+
+### Observability
+
+| Component             | Purpose |
+|-----------------------|---------|
+| **Prometheus**        | Scrapes metrics from the API, Celery, and the link checker |
+| **Grafana**           | Pre-provisioned dashboard for crawl rate, queue depth, error rate |
+| **Flower**            | Live Celery task inspection at port 5555 |
+| **celery-exporter**   | Exposes Celery queue metrics in Prometheus format |
+| **JSON logging**      | Structured logs via `python-json-logger` for ingestion into log pipelines |
+
+### Security
+
+| Component                       | Purpose |
+|----------------------------------|---------|
+| **JWT auth** (`python-jose`)    | Stateless authentication on protected endpoints |
+| **bcrypt**                       | Password hashing |
+| **Pydantic validation**         | Input validation on every API endpoint |
+
+### Tooling and Quality
+
+| Tool                | Purpose |
+|---------------------|---------|
+| **Poetry**          | Python dependency management with lockfile |
+| **Black + Ruff**    | Formatting and linting (line length 100) |
+| **pytest**          | Unit and integration test runner |
+| **GitHub Actions**  | CI for both Python and Go on every push |
+
+---
+
+## Project Structure
+
+```
+distributed-crawler/
+│
+├── src/                              Python source
+│   ├── api/                          FastAPI application
+│   │   ├── main.py                   App entry point and middleware setup
+│   │   ├── auth.py                   JWT token issuance and validation
+│   │   ├── dependencies.py           Reusable FastAPI dependencies
+│   │   ├── metrics.py                Prometheus metric definitions
+│   │   ├── routes/
+│   │   │   ├── jobs.py               Submit and retrieve crawl jobs
+│   │   │   ├── results.py            Fetch broken links and crawl results
+│   │   │   ├── search.py             Full-text search over crawled pages
+│   │   │   ├── auth.py               Login and registration endpoints
+│   │   │   └── health.py             Liveness and readiness probes
+│   │   └── schemas/                  Pydantic request and response models
+│   │
+│   ├── worker/                       Celery worker code
+│   │   ├── celery_app.py             Celery configuration and broker setup
+│   │   ├── base_task.py              Base task class with retry logic
+│   │   └── tasks/
+│   │       └── crawler.py            The crawl task itself
+│   │
+│   ├── crawler/                      Crawling primitives
+│   │   ├── playwright_crawler.py     Browser-based page fetcher
+│   │   ├── link_extractor.py         Parses links from rendered HTML
+│   │   ├── link_validator.py         Internal validation helpers
+│   │   ├── politeness.py             Robots.txt parsing and enforcement
+│   │   └── rate_limiter.py           Redis token bucket implementation
+│   │
+│   ├── db/                           Storage layer
+│   │   ├── elasticsearch_client.py   ES connection wrapper
+│   │   ├── indices.py                Index mappings and settings
+│   │   ├── models/                   Document schemas for jobs, pages, broken links, DLQ
+│   │   ├── repositories/             Data access methods per entity
+│   │   └── migrations/               Alembic migrations
+│   │
+│   ├── core/                         Cross-cutting concerns
+│   │   ├── config.py                 Pydantic Settings with env var loading
+│   │   ├── constants.py              Shared constants
+│   │   ├── exceptions.py             Domain exception types
+│   │   └── logging.py                JSON logging setup
+│   │
+│   └── utils/
+│       ├── url_utils.py              URL normalization, domain extraction
+│       └── retry_utils.py            Exponential backoff helpers
+│
+├── services/link_checker/            Go microservice
+│   ├── main.go                       Kafka consumer entrypoint
+│   ├── checker.go                    Parallel URL validation logic
+│   ├── es.go                         Elasticsearch writer
+│   ├── metrics.go                    Prometheus metrics
+│   ├── checker_test.go               Unit tests
+│   └── go.mod / go.sum               Go module manifest
+│
+├── frontend/                         Next.js dashboard
+│   ├── app/
+│   │   ├── page.tsx                  Home (submit a crawl)
+│   │   ├── jobs/page.tsx             Job list and live progress
+│   │   ├── search/page.tsx           Full-text search UI
+│   │   ├── layout.tsx                Root layout
+│   │   └── globals.css               Tailwind imports
+│   ├── components/toast.tsx          Toast notification component
+│   ├── lib/api.ts                    Typed REST client
+│   └── package.json
+│
+├── docker/                           Container build files
+│   ├── Dockerfile.api                Multi-stage FastAPI image
+│   ├── Dockerfile.worker             Multi-stage Celery worker image
+│   └── Dockerfile.link_checker       Multi-stage Go image
+│
+├── k8s/                              Kubernetes manifests
+│   ├── namespace.yaml
+│   ├── api.yaml                      API Deployment and Service
+│   ├── worker.yaml                   Worker Deployment with replicas
+│   ├── link-checker.yaml             Go service Deployment
+│   ├── redis.yaml                    Redis StatefulSet
+│   ├── kafka.yaml                    Kafka and Zookeeper
+│   └── elasticsearch.yaml            Elasticsearch StatefulSet
+│
+├── prometheus/
+│   └── prometheus.yml                Scrape config for all services
+│
+├── grafana/
+│   ├── dashboards/crawler.json       Pre-built crawler dashboard
+│   └── provisioning/                 Auto-provisioned datasource and dashboards
+│
+├── tests/
+│   ├── unit/                         Fast, isolated tests
+│   │   ├── test_link_extractor.py
+│   │   ├── test_url_utils.py
+│   │   └── test_retry_utils.py
+│   └── integration/                  Real Elasticsearch and Redis required
+│       ├── test_api_jobs.py
+│       ├── test_job_repository.py
+│       └── test_link_repository.py
+│
+├── .github/workflows/
+│   ├── test.yml                      Runs pytest and go test on every push
+│   └── docker.yml                    Builds and publishes container images
+│
+├── scripts/                          Operational scripts
+├── alembic.ini                       Database migration config
+├── pyproject.toml                    Poetry config, Black, Ruff, pytest settings
+├── docker-compose.yml                Local development stack
+├── .env.example                      Environment variable template
+└── README.md
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+You only need Docker installed. Everything else runs in containers.
+
+For local frontend development, you also need Node.js 18+.
+
+### One-Command Backend Startup
 
 ```bash
 docker-compose up -d
 ```
 
-Then open the frontend (run separately):
+This brings up the full backend stack:
+
+| Service        | URL                        | Purpose |
+|----------------|----------------------------|---------|
+| API + docs     | http://localhost:8000/docs | Interactive Swagger UI |
+| Flower         | http://localhost:5555      | Celery task inspector |
+| Prometheus     | http://localhost:9090      | Metrics queries |
+| Grafana        | http://localhost:3001      | Crawler dashboards (admin / admin) |
+| Elasticsearch  | http://localhost:9200      | Direct ES queries |
+
+### Frontend
+
+The Next.js dashboard runs separately for faster iteration:
 
 ```bash
 cd frontend
@@ -30,40 +398,141 @@ npm install
 npm run dev
 ```
 
-Frontend is at `localhost:3000`, API at `localhost:8000/docs`, Grafana at `localhost:3001`.
+Open http://localhost:3000.
 
-## How it works
-
-1. Submit a URL through the UI
-2. A Celery worker crawls it with a real browser (Playwright), extracts every link
-3. Internal links get queued for further crawling (BFS, configurable depth/page limits)
-4. External links get pushed to Kafka, where the Go service picks them up and validates them
-5. Broken links and full page content land in Elasticsearch
-6. The frontend polls every 2s for live progress and fires a toast when the job finishes
-
-Per-domain rate limiting (Redis token bucket), robots.txt support, exponential backoff retries, and a dead letter queue keep things polite and resilient.
-
-## Hitting the API directly
+### Submit Your First Crawl
 
 ```bash
-# Submit a job
-curl -X POST localhost:8000/api/v1/jobs \
+curl -X POST http://localhost:8000/api/v1/jobs \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "max_depth": 3, "max_pages": 100}'
-
-# Check status
-curl localhost:8000/api/v1/jobs/{job_id}
-
-# Get broken links
-curl localhost:8000/api/v1/results/{job_id}/broken-links
-
-# Search across all crawled pages
-curl "localhost:8000/api/v1/search?q=keyword"
+  -d '{"url": "https://example.com", "max_depth": 2, "max_pages": 50}'
 ```
 
-Full docs at `localhost:8000/docs`.
+The response includes a `job_id`. Use it to poll progress or open the dashboard at http://localhost:3000 to watch live.
 
-## Tests
+### Tear Down
+
+```bash
+docker-compose down -v
+```
+
+The `-v` flag also removes persisted Elasticsearch, Redis, and Kafka data.
+
+---
+
+## API Reference
+
+Full interactive docs at http://localhost:8000/docs (Swagger UI).
+
+### Submit a Job
+
+```http
+POST /api/v1/jobs
+Content-Type: application/json
+
+{
+  "url": "https://example.com",
+  "max_depth": 3,
+  "max_pages": 100
+}
+```
+
+### Get Job Status
+
+```http
+GET /api/v1/jobs/{job_id}
+```
+
+Returns crawl progress: pages visited, links queued, broken links found so far, current status (PENDING, RUNNING, COMPLETED, FAILED).
+
+### Get Broken Links
+
+```http
+GET /api/v1/results/{job_id}/broken-links
+```
+
+Returns the full list of broken links discovered, including the source page, the dead URL, and the HTTP status code that classified it as broken.
+
+### Full-Text Search
+
+```http
+GET /api/v1/search?q=keyword
+```
+
+Searches across all crawled page content using Elasticsearch.
+
+### Authentication
+
+```http
+POST /api/v1/auth/register
+POST /api/v1/auth/login
+```
+
+Returns a JWT bearer token to include as `Authorization: Bearer <token>` on protected endpoints.
+
+---
+
+## Configuration
+
+All configuration is via environment variables, defined in `.env`. Copy `.env.example` to `.env` and adjust.
+
+### Application
+
+| Variable          | Description                  | Default |
+|-------------------|------------------------------|---------|
+| `APP_NAME`        | Display name                 | `Distributed Web Crawler` |
+| `DEBUG`           | Enable debug mode            | `False` |
+
+### Elasticsearch
+
+| Variable             | Description       | Default                  |
+|----------------------|-------------------|--------------------------|
+| `ELASTICSEARCH_URL`  | Cluster URL       | `http://localhost:9200`  |
+
+### Redis and Celery
+
+| Variable                       | Description                | Default                  |
+|--------------------------------|----------------------------|--------------------------|
+| `REDIS_URL`                    | Redis connection           | `redis://localhost:6379/0` |
+| `REDIS_MAX_CONNECTIONS`        | Pool size                  | `50`                     |
+| `CELERY_BROKER_URL`            | Celery broker              | `redis://localhost:6379/0` |
+| `CELERY_RESULT_BACKEND`        | Celery results             | `redis://localhost:6379/1` |
+| `CELERY_TASK_SOFT_TIME_LIMIT`  | Soft task timeout (seconds)| `300`                    |
+| `CELERY_TASK_TIME_LIMIT`       | Hard task timeout (seconds)| `360`                    |
+
+### Crawler
+
+| Variable                          | Description                            | Default |
+|-----------------------------------|----------------------------------------|---------|
+| `CRAWLER_USER_AGENT`              | User-Agent string sent to target sites | `DistributedCrawler/1.0 (...)` |
+| `CRAWLER_DEFAULT_TIMEOUT`         | Per-page fetch timeout (seconds)       | `30`    |
+| `CRAWLER_MAX_DEPTH`               | BFS depth cap                          | `3`     |
+| `CRAWLER_MAX_PAGES`               | Max pages crawled per job              | `100`   |
+| `CRAWLER_RESPECT_ROBOTS`          | Honor robots.txt                       | `True`  |
+| `CRAWLER_RATE_LIMIT_PER_DOMAIN`   | Requests per second per domain         | `1.0`   |
+
+### Retry and Dead Letter
+
+| Variable               | Description                              | Default |
+|------------------------|------------------------------------------|---------|
+| `RETRY_MAX_ATTEMPTS`   | Max retries before sending to DLQ        | `5`     |
+| `RETRY_BACKOFF_BASE`   | Initial backoff (seconds)                | `60`    |
+| `RETRY_BACKOFF_MAX`    | Backoff cap (seconds)                    | `600`   |
+| `DLQ_ENABLED`          | Capture exhausted tasks                  | `True`  |
+| `DLQ_ALERT_WEBHOOK`    | Optional webhook for DLQ events          | (none)  |
+
+---
+
+## CI/CD Pipeline
+
+The GitHub Actions workflows in `.github/workflows/` run on every push:
+
+| Workflow      | Purpose |
+|---------------|---------|
+| `test.yml`    | Runs `pytest` for Python and `go test ./...` for the Go link checker. Includes coverage reporting. |
+| `docker.yml`  | Builds and publishes container images for the API, worker, and link checker. |
+
+Run tests locally:
 
 ```bash
 # Python
@@ -73,23 +542,61 @@ poetry run pytest
 cd services/link_checker && go test ./...
 ```
 
-CI runs both on every push.
+---
 
-## Layout
+## Observability
 
-```
-src/                # Python — FastAPI + Celery + crawler
-services/link_checker/   # Go — Kafka consumer + URL validator
-frontend/           # Next.js UI
-k8s/                # Kubernetes manifests
-prometheus/         # Scrape config
-grafana/            # Dashboard JSON
-.github/workflows/  # CI/CD
-```
+### Metrics
 
-## Notes
+Both the Python API and the Go link checker expose Prometheus-formatted metrics:
 
-- Tuned for ~2-6 pages/sec with default settings (Playwright is slow on purpose, it waits for the full page to render)
-- The Go link checker handles 100-300 URLs/sec
-- 403/429 responses don't count as broken links, those mean the site is blocking bots, not that the link is dead
-- Set `CRAWLER_MAX_DEPTH` and `CRAWLER_MAX_PAGES` in `.env` to control crawl scope
+- `crawler_pages_crawled_total`
+- `crawler_links_discovered_total`
+- `crawler_broken_links_total`
+- `crawler_request_duration_seconds`
+- `link_check_duration_seconds` (Go service)
+- Celery queue depth and task latency via `celery-exporter`
+
+### Dashboards
+
+A pre-built Grafana dashboard is provisioned automatically at startup. It includes:
+
+- Pages crawled per second
+- Broken links discovered over time
+- Celery task latency percentiles
+- Queue depth per worker
+- HTTP error rate by domain
+
+### Task Inspection
+
+Flower runs at http://localhost:5555 for live Celery task inspection: see what's currently being processed, retry counts, task arguments, and error tracebacks.
+
+### Logging
+
+All Python services log JSON-formatted records via `python-json-logger`, ready for ingestion into log aggregation systems.
+
+---
+
+## Performance and Limits
+
+Measured throughput on a single developer machine with default settings:
+
+| Stage              | Throughput              | Bottleneck |
+|--------------------|-------------------------|------------|
+| Page rendering     | 2 to 6 pages per second | Playwright (intentional: waits for full page render) |
+| Link extraction    | Negligible              | CPU-bound, fast |
+| External validation| 100 to 300 URLs per second per Go replica | Network I/O |
+| Elasticsearch writes | 1000+ docs per second | Indexing throughput |
+
+**Scaling levers:**
+
+- Increase Celery worker replicas in `docker-compose.yml` (default: 3)
+- Increase Go link checker replicas (default: 2, each with 50 goroutines)
+- Add Kafka partitions to the `link_check_jobs` topic for parallel consumer groups
+- Increase `CRAWLER_RATE_LIMIT_PER_DOMAIN` if you have permission to hit a target site harder
+
+**Operational notes:**
+
+- HTTP 403 and 429 responses are NOT counted as broken links. They mean the target is blocking automated traffic, not that the URL is dead.
+- Playwright is intentionally slow because it waits for the full page including async JavaScript to render. An HTTP-only crawler would be 10x faster but miss SPA content entirely.
+- The default crawl scope (depth 3, max 100 pages) is conservative. Override per-job in the API payload or globally in `.env`.
